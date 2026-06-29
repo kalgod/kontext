@@ -99,6 +99,7 @@ def main():
                         help="Output filename. Defaults to result.png (baseline) or result_regione.png (RegionE).")
     parser.add_argument("--baseline_for_psnr", type=str, default="result.png",
                         help="When --use_regione, compute PSNR against this baseline image.")
+    parser.add_argument("--debug", action="store_true", help="Print per-step RegionE state for debugging.")
     args = parser.parse_args()
 
     base_path = "./models"
@@ -149,6 +150,7 @@ def main():
                 refresh_step=args.refresh_step,
                 threshold=args.threshold,
                 erosion_dilation=args.erosion_dilation,
+                debug=args.debug,
             ),
         )
         print(f"[RegionE] enabled — warmup={args.warmup_step}, post={args.post_step}, "

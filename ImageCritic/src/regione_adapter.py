@@ -58,6 +58,7 @@ class RegionEArgs:
     erosion_dilation: bool = True
     patch_size: int = 2
     vae_scale_factor: int = 8
+    debug: bool = False
 
 
 # ============================================================================
@@ -185,6 +186,7 @@ class _RegionEManager:
         self.erosion_dilation = args.erosion_dilation
         self.patch_size = args.patch_size
         self.vae_scale_factor = args.vae_scale_factor
+        self.debug = getattr(args, "debug", False)
         self.refresh_step = sorted(int(x) for x in str(args.refresh_step).split(",") if x.strip())
         if self.refresh_step:
             assert min(self.refresh_step) > self.warmup_step + 1, "refresh_step must be > warmup_step + 1"
@@ -311,25 +313,39 @@ class RegionEAttnWrapper(nn.Module):
         #   double block:  [B,        L + 2L, dim_inner] (image side only)
         self.k_cache: Optional[torch.Tensor] = None
         self.v_cache: Optional[torch.Tensor] = None
+        # Debug counters
+        self._dbg_full = 0
+        self._dbg_capture = 0
+        self._dbg_sparse = 0
+        self._dbg_sparse_fallback = 0
 
     def reset_cache(self) -> None:
         self.k_cache = None
         self.v_cache = None
 
     # ------------------------------------------------------------------
-    def forward(
+    # NOTE: we override __call__ (not forward) so that
+    # `inspect.signature(processor.__call__)` exposes our named kwargs
+    # (image_rotary_emb, use_cond) to diffusers' Attention.forward, which
+    # filters cross_attention_kwargs based on the processor's __call__
+    # signature.  The default nn.Module __call__ is `(*args, **kwargs)` and
+    # that filter would silently drop every named kwarg — including
+    # image_rotary_emb, which would corrupt every attention output.
+    #
+    # ImageCritic's LoRA processors do exactly the same.
+    def __call__(
         self,
         attn: Attention,
         hidden_states: torch.FloatTensor,
         encoder_hidden_states: torch.FloatTensor = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
-        **kw,
+        use_cond: bool = False,
     ):
         m = MANAGER
         if not m.enable:
             return self._delegate(attn, hidden_states, encoder_hidden_states,
-                                  attention_mask, image_rotary_emb, **kw)
+                                  attention_mask, image_rotary_emb, use_cond)
 
         cur = m.current_step
         is_pre = cur < m.warmup_step - 1
@@ -339,28 +355,39 @@ class RegionEAttnWrapper(nn.Module):
         is_post = cur > m.inference_step - m.post_step - 1
 
         if is_pre or is_post:
+            self._dbg_full += 1
             return self._delegate(attn, hidden_states, encoder_hidden_states,
-                                  attention_mask, image_rotary_emb, **kw)
+                                  attention_mask, image_rotary_emb, use_cond)
         if is_cache_write:
+            self._dbg_capture += 1
             return self._forward_capture(attn, hidden_states, encoder_hidden_states,
-                                         attention_mask, image_rotary_emb, **kw)
+                                         attention_mask, image_rotary_emb, use_cond)
         # SPARSE
+        if self.k_cache is None or self.v_cache is None:
+            self._dbg_sparse_fallback += 1
+        else:
+            self._dbg_sparse += 1
         return self._forward_sparse(attn, hidden_states, encoder_hidden_states, image_rotary_emb)
 
     # ------------------------------------------------------------------
-    def _delegate(self, attn, hidden_states, encoder_hidden_states, attention_mask, image_rotary_emb, **kw):
+    def _delegate(self, attn, hidden_states, encoder_hidden_states, attention_mask, image_rotary_emb, use_cond=False):
+        # Inner ImageCritic processors accept (attn, hidden_states,
+        # encoder_hidden_states, attention_mask, image_rotary_emb, use_cond);
+        # vanilla diffusers FluxAttnProcessor2_0 doesn't accept use_cond.
         try:
             return self.inner(attn, hidden_states=hidden_states,
                               encoder_hidden_states=encoder_hidden_states,
                               attention_mask=attention_mask,
-                              image_rotary_emb=image_rotary_emb, **kw)
+                              image_rotary_emb=image_rotary_emb,
+                              use_cond=use_cond)
         except TypeError:
             return self.inner(attn, hidden_states=hidden_states,
                               encoder_hidden_states=encoder_hidden_states,
-                              image_rotary_emb=image_rotary_emb, **kw)
+                              attention_mask=attention_mask,
+                              image_rotary_emb=image_rotary_emb)
 
     # ------------------------------------------------------------------
-    def _forward_capture(self, attn, hidden_states, encoder_hidden_states, attention_mask, image_rotary_emb, **kw):
+    def _forward_capture(self, attn, hidden_states, encoder_hidden_states, attention_mask, image_rotary_emb, use_cond=False):
         """Full forward; tap K/V (pre-norm pre-RoPE) via forward hooks on
         attn.to_k / attn.to_v.  These hooks fire BEFORE LoRA delta is added
         by the inner processor; we re-add the LoRA delta ourselves so the
@@ -379,7 +406,7 @@ class RegionEAttnWrapper(nn.Module):
         h_v = attn.to_v.register_forward_hook(hk_v)
         try:
             out = self._delegate(attn, hidden_states, encoder_hidden_states,
-                                 attention_mask, image_rotary_emb, **kw)
+                                 attention_mask, image_rotary_emb, use_cond)
         finally:
             h_k.remove()
             h_v.remove()
@@ -879,6 +906,20 @@ def _regione_inline_call(
             is_refresh = (MANAGER.prev_refresh_step is not None
                           and MANAGER.current_step == MANAGER.prev_refresh_step)
             cond_concat = (image_latents is not None) and (in_warmup or in_post or is_refresh)
+
+            if MANAGER.debug:
+                # Print regime + first-attn counters once per step
+                first_attn = next(
+                    (mod.processor for _, mod in self.transformer.named_modules()
+                     if isinstance(mod, Attention) and isinstance(mod.processor, RegionEAttnWrapper)),
+                    None,
+                )
+                if first_attn is not None:
+                    print(f"[regione][step={i:02d}] cond_concat={cond_concat} "
+                          f"latents={tuple(latents.shape)} edited={None if MANAGER.edited_ids is None else MANAGER.edited_ids.shape[1]} "
+                          f"unedited={None if MANAGER.unedited_ids is None else MANAGER.unedited_ids.shape[1]} "
+                          f"prev_refresh={MANAGER.prev_refresh_step} "
+                          f"first_attn(full,cap,sparse,fb)=({first_attn._dbg_full},{first_attn._dbg_capture},{first_attn._dbg_sparse},{first_attn._dbg_sparse_fallback})")
 
             self._current_timestep = t
             if image_embeds is not None:
