@@ -36,6 +36,7 @@ import types
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from diffusers.models.attention_processor import Attention
@@ -275,8 +276,12 @@ MANAGER = _RegionEManager()
 # ============================================================================
 # Attention processor wrapper
 # ============================================================================
-class RegionEAttnWrapper:
+class RegionEAttnWrapper(nn.Module):
     """Wrap inner processor (LoRA / vanilla).
+
+    MUST be an nn.Module because ImageCritic's LoRA processors ARE nn.Modules
+    (they own LoRA parameters), and torch.nn.Module.__setattr__ refuses to
+    swap an nn.Module child for a non-Module object.
 
     Three regimes (gated by MANAGER.current_step + manager refresh state):
 
@@ -291,7 +296,15 @@ class RegionEAttnWrapper:
     """
 
     def __init__(self, inner, single: bool):
-        self.inner = inner
+        super().__init__()
+        # Register inner as a submodule so its parameters stay accessible.
+        # If inner is not an nn.Module (e.g. plain FluxAttnProcessor2_0),
+        # store as a regular attribute via __dict__ to bypass nn.Module's
+        # type check.
+        if isinstance(inner, nn.Module):
+            self.inner = inner
+        else:
+            object.__setattr__(self, "inner", inner)
         self.single = single
         # Caches store pre-norm pre-RoPE K/V at FULL length:
         #   single block:  [B, 512 + L + 2L, dim_inner]  (text + target + cond)
@@ -304,7 +317,7 @@ class RegionEAttnWrapper:
         self.v_cache = None
 
     # ------------------------------------------------------------------
-    def __call__(
+    def forward(
         self,
         attn: Attention,
         hidden_states: torch.FloatTensor,
@@ -348,40 +361,37 @@ class RegionEAttnWrapper:
 
     # ------------------------------------------------------------------
     def _forward_capture(self, attn, hidden_states, encoder_hidden_states, attention_mask, image_rotary_emb, **kw):
-        """Full forward; tap K/V (pre-norm pre-RoPE) by hooking attn.to_k / attn.to_v."""
+        """Full forward; tap K/V (pre-norm pre-RoPE) via forward hooks on
+        attn.to_k / attn.to_v.  These hooks fire BEFORE LoRA delta is added
+        by the inner processor; we re-add the LoRA delta ourselves so the
+        cached tensors match the inner processor's exact (k_base + LoRA*x)
+        composition."""
         captured: Dict[str, torch.Tensor] = {}
-        # Hook to_k / to_v: their output is the LAST call we care about
-        # (the inner processor calls them exactly once).
-        orig_to_k = attn.to_k.forward
-        orig_to_v = attn.to_v.forward
 
-        def hk_k(x, *a, **kw):
-            out = orig_to_k(x, *a, **kw)
-            captured["k_base"] = out.detach()
-            captured["k_in"] = x.detach()
-            return out
+        def hk_k(_module, inputs, output):
+            captured["k_base"] = output.detach()
+            captured["k_in"] = inputs[0].detach()
 
-        def hk_v(x, *a, **kw):
-            out = orig_to_v(x, *a, **kw)
-            captured["v_base"] = out.detach()
-            captured["v_in"] = x.detach()
-            return out
+        def hk_v(_module, inputs, output):
+            captured["v_base"] = output.detach()
 
-        attn.to_k.forward = hk_k
-        attn.to_v.forward = hk_v
+        h_k = attn.to_k.register_forward_hook(hk_k)
+        h_v = attn.to_v.register_forward_hook(hk_v)
         try:
             out = self._delegate(attn, hidden_states, encoder_hidden_states,
                                  attention_mask, image_rotary_emb, **kw)
         finally:
-            attn.to_k.forward = orig_to_k
-            attn.to_v.forward = orig_to_v
+            h_k.remove()
+            h_v.remove()
 
-        # Compose K, V with LoRA delta (matches inner LoRA processor exactly)
+        # Compose K, V with LoRA delta (matches inner LoRA processor exactly).
+        # NOTE: the inner processor calls to_k/to_v exactly once on
+        # `hidden_states`, so captured['k_in'] equals hidden_states.
         k = captured["k_base"]
         v = captured["v_base"]
         n_loras = getattr(self.inner, "n_loras", 0)
         if n_loras:
-            x_in = captured["k_in"]   # k_in == v_in == hidden_states
+            x_in = captured["k_in"]
             for i in range(n_loras):
                 k = k + self.inner.lora_weights[i] * self.inner.k_loras[i](x_in)
                 v = v + self.inner.lora_weights[i] * self.inner.v_loras[i](x_in)
@@ -956,13 +966,17 @@ def enable_regione(pipeline, args: RegionEArgs) -> None:
         return
     MANAGER.configure(args)
 
-    # Wrap each Attention.processor
+    # Wrap each Attention.processor.
+    # ImageCritic's LoRA processors are nn.Module instances; our wrapper is
+    # nn.Module too, so a Module->Module assignment via set_processor (which
+    # boils down to nn.Module.__setattr__) is allowed.
     transformer = pipeline.transformer
     for name, mod in transformer.named_modules():
         if isinstance(mod, Attention):
             inner = mod.processor
             single = "single_transformer_blocks" in name
-            mod.processor = RegionEAttnWrapper(inner, single=single)
+            wrapper = RegionEAttnWrapper(inner, single=single)
+            mod.set_processor(wrapper)
 
     # Patch scheduler.step
     pipeline.scheduler.step = _make_patched_scheduler_step(pipeline.scheduler)
