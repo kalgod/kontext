@@ -431,7 +431,6 @@ class FluxTransformer2DModel(
                 logger.warning(
                     "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
                 )
-        print(hidden_states.shape,encoder_hidden_states.shape)
         hidden_states = self.x_embedder(hidden_states)
         if use_condition: cond_hidden_states = self.x_embedder(cond_hidden_states)
 
