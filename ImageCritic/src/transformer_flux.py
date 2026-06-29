@@ -74,11 +74,11 @@ class FluxSingleTransformerBlock(nn.Module):
             norm_cond_hidden_states, cond_gate = self.norm(cond_hidden_states, emb=cond_temb)
             mlp_cond_hidden_states = self.act_mlp(self.proj_mlp(norm_cond_hidden_states))
         
-        norm_hidden_states_concat = torch.concat([norm_hidden_states, norm_cond_hidden_states], dim=-2)
+        if use_cond: norm_hidden_states = torch.concat([norm_hidden_states, norm_cond_hidden_states], dim=-2)
         
         joint_attention_kwargs = joint_attention_kwargs or {}
         attn_output = self.attn(
-            hidden_states=norm_hidden_states_concat,
+            hidden_states=norm_hidden_states,
             image_rotary_emb=image_rotary_emb,
             use_cond=use_cond,
             **joint_attention_kwargs,
@@ -170,7 +170,7 @@ class FluxTransformerBlock(nn.Module):
             encoder_hidden_states, emb=temb
         )
         
-        norm_hidden_states = torch.concat([norm_hidden_states, norm_cond_hidden_states], dim=-2)
+        if use_cond: norm_hidden_states = torch.concat([norm_hidden_states, norm_cond_hidden_states], dim=-2)
         
         joint_attention_kwargs = joint_attention_kwargs or {}
         # Attention.
@@ -431,9 +431,9 @@ class FluxTransformer2DModel(
                 logger.warning(
                     "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
                 )
-
+        print(hidden_states.shape,encoder_hidden_states.shape)
         hidden_states = self.x_embedder(hidden_states)
-        cond_hidden_states = self.x_embedder(cond_hidden_states)
+        if use_condition: cond_hidden_states = self.x_embedder(cond_hidden_states)
 
         timestep = timestep.to(hidden_states.dtype) * 1000
         if guidance is not None:
@@ -447,13 +447,15 @@ class FluxTransformer2DModel(
             else self.time_text_embed(timestep, guidance, pooled_projections)
         )
         
-        cond_temb = (
-            self.time_text_embed(torch.ones_like(timestep) * 0, pooled_projections)
-                if guidance is None
-                else self.time_text_embed(
-                    torch.ones_like(timestep) * 0, guidance, pooled_projections
+        if use_condition:
+            cond_temb = (
+                self.time_text_embed(torch.ones_like(timestep) * 0, pooled_projections)
+                    if guidance is None
+                    else self.time_text_embed(
+                        torch.ones_like(timestep) * 0, guidance, pooled_projections
+                    )
                 )
-            )
+        else: cond_temb=None
         
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
@@ -477,6 +479,8 @@ class FluxTransformer2DModel(
             ip_adapter_image_embeds = joint_attention_kwargs.pop("ip_adapter_image_embeds")
             ip_hidden_states = self.encoder_hid_proj(ip_adapter_image_embeds)
             joint_attention_kwargs.update({"ip_hidden_states": ip_hidden_states})
+
+        
 
         for index_block, block in enumerate(self.transformer_blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
@@ -548,6 +552,7 @@ class FluxTransformer2DModel(
                     cond_hidden_states=cond_hidden_states if use_condition else None,
                     **ckpt_kwargs,
                 )
+                
 
             else:
                 hidden_states, cond_hidden_states = block(
@@ -558,6 +563,8 @@ class FluxTransformer2DModel(
                     image_rotary_emb=image_rotary_emb,
                     joint_attention_kwargs=joint_attention_kwargs,
                 )
+
+                
 
             # controlnet residual
             if controlnet_single_block_samples is not None:

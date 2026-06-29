@@ -1,10 +1,11 @@
 import torch
 from PIL import Image
-from diffusers import (
-    AutoencoderKL,
-    FlowMatchEulerDiscreteScheduler,
-    FluxTransformer2DModel
-)
+# from diffusers import (
+#     AutoencoderKL,
+#     FlowMatchEulerDiscreteScheduler,
+#     FluxTransformer2DModel
+# )
+from src.transformer_flux import FluxTransformer2DModel
 from transformers import CLIPTokenizer, PretrainedConfig, T5TokenizerFast
 from src.lora_helper import set_single_lora, set_multi_lora
 from safetensors.torch import load_file
@@ -63,15 +64,19 @@ print("当前设备：", torch.cuda.current_device())
 print("设备名称：", torch.cuda.get_device_name(0))
 
 device = "cuda:0"
-
-pipeline = FluxKontextPipelineWithPhotoEncoderAddTokens.from_pretrained("./kontext", torch_dtype=torch.bfloat16)
-pipeline.to(device)
-# transformer = FluxTransformer2DModel.from_pretrained(
-#     "./kontext", 
-#     subfolder="transformer",
-#     torch_dtype=torch.bfloat16, 
-# )
+transformer = FluxTransformer2DModel.from_pretrained(
+    "./kontext", 
+    subfolder="transformer",
+    torch_dtype=torch.bfloat16, 
+)
 # transformer.to(device)
+
+pipeline = FluxKontextPipelineWithPhotoEncoderAddTokens.from_pretrained(
+    "./kontext",
+    transformer=transformer,
+    torch_dtype=torch.bfloat16,
+)
+pipeline.to(device)
 
 state_dict = load_file(detail_encoder_path)
 detail_encoder = DetailEncoder().to(dtype=pipeline.transformer.dtype, device=device)
