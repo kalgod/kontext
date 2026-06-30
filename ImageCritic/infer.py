@@ -100,6 +100,10 @@ def main():
     parser.add_argument("--baseline_for_psnr", type=str, default="result.png",
                         help="When --use_regione, compute PSNR against this baseline image.")
     parser.add_argument("--debug", action="store_true", help="Print per-step RegionE state for debugging.")
+    parser.add_argument("--fixed_noise", type=str, default="./fixed_noise_step0000.pt",
+                        help="Path to a fixed initial noise tensor (unpacked, VAE space shape [B,C,Hl,Wl]). "
+                             "If the file exists it is loaded and replaces the random init; "
+                             "set to '' to disable and use the random generator instead.")
     args = parser.parse_args()
 
     base_path = "./models"
@@ -169,6 +173,42 @@ def main():
     prompt = f"use the {product_tag} in IMG1 as a reference to refine, replace, enhance the {product_tag} in IMG2"
     print("prompt1:", prompt)
 
+    # ----------------------------------------------------------------------
+    # Optional: load a fixed initial noise saved with shape
+    #   [batch, vae_latent_channels, Hl, Wl]    (VAE space, NOT packed)
+    # The pipeline's prepare_latents() will skip its random init when
+    # `latents=` is provided, but it ALSO skips pack_latents in that branch
+    # (see kontext_custom_pipeline.py:1660), so we have to pack it ourselves.
+    # ----------------------------------------------------------------------
+    init_latents = None
+    if args.fixed_noise and os.path.isfile(args.fixed_noise):
+        fixed = torch.load(args.fixed_noise, weights_only=True)
+        print(f"[fixed_noise] loaded {args.fixed_noise} shape={tuple(fixed.shape)} "
+              f"mean={fixed.float().mean().item():.6f} std={fixed.float().std().item():.6f}")
+        # Pack [B, C, Hl, Wl] -> [B, Hl/2 * Wl/2, C*4] using the same routine
+        # the pipeline uses internally for its own random latents.
+        nc = pipeline.transformer.config.in_channels // 4
+        vae_sf = pipeline.vae_scale_factor
+        # height/width (image space) -> latent space (VAE 8x), rounded for the 2x2 patching
+        lh = 2 * (size[1] // (vae_sf * 2))
+        lw = 2 * (size[0] // (vae_sf * 2))
+        assert fixed.shape[-2:] == (lh, lw), (
+            f"fixed noise shape {tuple(fixed.shape)} does not match expected "
+            f"latent (Hl,Wl)=({lh},{lw}). Regenerate the .pt at the current resolution."
+        )
+        fixed = fixed.to(device=device, dtype=pipeline.transformer.dtype)
+        init_latents = pipeline._pack_latents(fixed, fixed.shape[0], nc, lh, lw)
+        print(f"[fixed_noise] packed -> {tuple(init_latents.shape)}; "
+              f"random `--seed {args.seed}` is ignored")
+    elif args.fixed_noise:
+        print(f"[fixed_noise] {args.fixed_noise} not found, falling back to random seed={args.seed}")
+
+    # ---- profile pipeline call (CUDA-event based, async-safe) ----
+    torch.cuda.synchronize()
+    ev_start = torch.cuda.Event(enable_timing=True)
+    ev_end = torch.cuda.Event(enable_timing=True)
+    ev_start.record()
+
     image = pipeline(
         image_A=cond_A_image,
         image_B=cond_B_image,
@@ -178,7 +218,15 @@ def main():
         guidance_scale=args.guidance_scale,
         num_inference_steps=args.num_inference_steps,
         generator=torch.Generator("cuda").manual_seed(args.seed),
+        latents=init_latents,
     ).images[0]
+
+    ev_end.record()
+    torch.cuda.synchronize()
+    pipeline_ms = ev_start.elapsed_time(ev_end)
+    tag = "RegionE" if args.use_regione else "baseline"
+    print(f"[time] pipeline ({tag}) = {pipeline_ms / 1000:.3f} s "
+          f"({pipeline_ms / args.num_inference_steps:.1f} ms/step over {args.num_inference_steps} steps)")
 
     display_width = size[0]
     display_height = size[1]
@@ -193,6 +241,24 @@ def main():
     concat_name = "concatenated_regione.png" if args.use_regione else "concatenated.png"
     concatenated_image.save(concat_name)
     print(f"[saved] {out_name}, {concat_name}")
+
+    # Persist this run's wall-clock so the next run can compute speedup
+    time_file = "result_regione.time" if args.use_regione else "result.time"
+    with open(time_file, "w") as f:
+        f.write(f"{pipeline_ms:.3f}\n")
+
+    if args.use_regione:
+        baseline_time_file = "result.time"
+        if os.path.isfile(baseline_time_file):
+            with open(baseline_time_file) as f:
+                baseline_ms = float(f.read().strip())
+            print(f"[time] baseline = {baseline_ms / 1000:.3f} s, "
+                  f"RegionE = {pipeline_ms / 1000:.3f} s, "
+                  f"speedup = {baseline_ms / pipeline_ms:.2f}x "
+                  f"(saved {(baseline_ms - pipeline_ms) / 1000:.3f} s)")
+        else:
+            print(f"[time] baseline {baseline_time_file} not found; "
+                  f"run `python infer.py` first to record baseline.")
 
     if args.use_regione:
         if os.path.isfile(args.baseline_for_psnr):
