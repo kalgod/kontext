@@ -16,6 +16,7 @@ from src.detail_encoder import DetailEncoder
 from src.kontext_custom_pipeline import FluxKontextPipelineWithPhotoEncoderAddTokens
 from src.regione_adapter import enable_regione, RegionEArgs
 from src.teacache_adapter import enable_teacache, TeaCacheArgs, teacache_summary
+from src.sage_adapter import enable_sageattn, SageArgs
 from diffusers.utils import load_image
 from huggingface_hub import hf_hub_download
 
@@ -90,6 +91,16 @@ def main():
                              "fires during RegionE FULL steps that are not warmup-1 / refresh / post.")
     parser.add_argument("--rel_l1_thresh", type=float, default=0.4,
                         help="TeaCache rel_l1_thresh. 0.25=1.5x, 0.4=1.8x, 0.6=2.0x, 0.8=2.25x.")
+    parser.add_argument("--use_sageattn", action="store_true",
+                        help="Replace SDPA with SageAttention (INT8 quantized) in LoRA processors.")
+    parser.add_argument("--sage_scope", choices=["full", "all"], default="full",
+                        help="full: only LoRA processors (full/refresh/post/warmup steps). "
+                             "all : LoRA processors + RegionE sparse path. "
+                             "Only relevant when --use_sageattn is set.")
+    parser.add_argument("--sage_kernel",
+                        choices=["auto", "qk_int8_pv_fp16", "qk_int8_pv_fp8", "qk_int8_pv_fp16_triton"],
+                        default="auto",
+                        help="Which sageattn kernel variant to call.")
     parser.add_argument("--num_inference_steps", type=int, default=28)
     parser.add_argument("--warmup_step", type=int, default=6)
     parser.add_argument("--post_step", type=int, default=2)
@@ -149,6 +160,22 @@ def main():
 
     pipeline.detail_encoder = detail_encoder
     set_single_lora(pipeline.transformer, kontext_lora_path, lora_weights=[1])
+
+    # SageAttention is a class-level patch on the LoRA processor classes,
+    # so install it right after LoRA processors are registered.  Order vs
+    # TeaCache / RegionE is flexible because sage's patch surface (LoRA
+    # processor.__call__) is independent of theirs (transformer.forward
+    # and Attention.processor).
+    if args.use_sageattn:
+        enable_sageattn(
+            pipeline,
+            SageArgs(
+                enable=True,
+                scope=args.sage_scope,
+                kernel=args.sage_kernel,
+                debug=args.debug,
+            ),
+        )
 
     # IMPORTANT: TeaCache patches transformer.forward.  RegionE wraps whatever
     # forward is currently bound on the transformer at enable time.  So the
@@ -252,6 +279,8 @@ def main():
         tag_parts.append("RegionE")
     if args.use_teacache:
         tag_parts.append(f"TeaCache(t={args.rel_l1_thresh})")
+    if args.use_sageattn:
+        tag_parts.append(f"Sage({args.sage_scope})")
     tag = "+".join(tag_parts) if tag_parts else "baseline"
     print(f"[time] pipeline ({tag}) = {pipeline_ms / 1000:.3f} s "
           f"({pipeline_ms / args.num_inference_steps:.1f} ms/step over {args.num_inference_steps} steps)")
@@ -262,12 +291,14 @@ def main():
     display_height = size[1]
     image = image.resize((display_width, display_height), Image.Resampling.LANCZOS)
 
-    # Suffix encodes the acceleration combo: "" / "_regione" / "_teacache" / "_regione_teacache"
+    # Suffix encodes the acceleration combo: "" / "_regione" / "_teacache" / "_sage" / "_regione_teacache" ...
     suffix = ""
     if args.use_regione:
         suffix += "_regione"
     if args.use_teacache:
         suffix += "_teacache"
+    if args.use_sageattn:
+        suffix += "_sage"
 
     out_name = args.output or f"result{suffix}.png"
     image.save(out_name)
