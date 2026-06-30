@@ -93,7 +93,7 @@ def main():
                         help="TeaCache rel_l1_thresh. 0.25=1.5x, 0.4=1.8x, 0.6=2.0x, 0.8=2.25x.")
     parser.add_argument("--use_sageattn", action="store_true",
                         help="Replace SDPA with SageAttention (INT8 quantized) in LoRA processors.")
-    parser.add_argument("--sage_scope", choices=["full", "all"], default="full",
+    parser.add_argument("--sage_scope", choices=["full", "all"], default="all",
                         help="full: only LoRA processors (full/refresh/post/warmup steps). "
                              "all : LoRA processors + RegionE sparse path. "
                              "Only relevant when --use_sageattn is set.")
@@ -105,7 +105,7 @@ def main():
     parser.add_argument("--warmup_step", type=int, default=6)
     parser.add_argument("--post_step", type=int, default=2)
     parser.add_argument("--refresh_step", type=str, default="16")
-    parser.add_argument("--threshold", type=float, default=0.93)
+    parser.add_argument("--threshold", type=float, default=0.95)
     parser.add_argument("--erosion_dilation", action="store_true", default=True)
     parser.add_argument("--no_erosion_dilation", dest="erosion_dilation", action="store_false")
     parser.add_argument("--guidance_scale", type=float, default=3.5)
@@ -291,51 +291,172 @@ def main():
     display_height = size[1]
     image = image.resize((display_width, display_height), Image.Resampling.LANCZOS)
 
-    # Suffix encodes the acceleration combo: "" / "_regione" / "_teacache" / "_sage" / "_regione_teacache" ...
-    suffix = ""
-    if args.use_regione:
-        suffix += "_regione"
-    if args.use_teacache:
-        suffix += "_teacache"
-    if args.use_sageattn:
-        suffix += "_sage"
+    # ----------------------------------------------------------------------
+    # Save under ./outputs/ with a descriptive filename:
+    #   baseline:         outputs/baseline_<gpu>_<sec>s.png
+    #   with accel:       outputs/<combo>_<gpu>_<sec>s_psnr<XX.XX>dB.png
+    # The baseline run also drops a small meta file so future runs can find
+    # it for PSNR / speedup comparison without relying on path conventions.
+    # ----------------------------------------------------------------------
+    OUTPUT_DIR = "./outputs"
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    out_name = args.output or f"result{suffix}.png"
-    image.save(out_name)
+    # Sanitize GPU name into a short slug ("h200", "a100", "l40", ...).
+    gpu_full = torch.cuda.get_device_name(0)
+    gpu_slug = gpu_full.replace("NVIDIA", "").replace(" ", "").lower()
+    for tok in ("h200", "h100", "a100", "a800", "l40", "l4", "v100", "rtx4090", "rtx3090"):
+        if tok in gpu_slug:
+            gpu_slug = tok
+            break
+
+    # Combo slug (used in filename instead of the pretty parens-y tag)
+    combo_parts = []
+    if args.use_regione:
+        combo_parts.append("regione")
+    if args.use_teacache:
+        combo_parts.append(f"teacache{args.rel_l1_thresh}")
+    if args.use_sageattn:
+        combo_parts.append(f"sage-{args.sage_scope}")
+    combo = "+".join(combo_parts) if combo_parts else "baseline"
+
+    # ----------------------------------------------------------------------
+    # Core args that always change the output
+    #   steps<N>     = --num_inference_steps
+    #   gs<G>        = --guidance_scale
+    #   <noise>      = "noise<basename>" if fixed_noise loaded, else "seed<N>"
+    # ----------------------------------------------------------------------
+    core_parts = [
+        f"steps{args.num_inference_steps}",
+        f"gs{args.guidance_scale}",
+    ]
+    if init_latents is not None:
+        # use the .pt file basename so different fixed-noise files are distinguishable
+        noise_tag = os.path.splitext(os.path.basename(args.fixed_noise))[0]
+        # strip non-alnum to keep filename safe
+        noise_tag = "".join(ch for ch in noise_tag if ch.isalnum() or ch in "-.")
+        core_parts.append(f"noise{noise_tag}")
+    else:
+        core_parts.append(f"seed{args.seed}")
+
+    # ----------------------------------------------------------------------
+    # Per-accelerator args that affect the result (only included when the
+    # corresponding accelerator is enabled)
+    # ----------------------------------------------------------------------
+    accel_parts = []
+    if args.use_regione:
+        # warmup, post, refresh, threshold, erosion_dilation
+        ed_flag = 1 if args.erosion_dilation else 0
+        # refresh_step may be "16" or "11,16,21" — make it filename-safe
+        refresh_safe = args.refresh_step.replace(",", "-")
+        accel_parts += [
+            f"w{args.warmup_step}",
+            f"p{args.post_step}",
+            f"r{refresh_safe}",
+            f"th{args.threshold}",
+            f"ed{ed_flag}",
+        ]
+    # TeaCache: rel_l1_thresh already encoded in combo, nothing else affects result
+    if args.use_sageattn:
+        # sage_kernel: different kernel can give slightly different numerical result
+        accel_parts.append(f"k{args.sage_kernel}")
+
+    sec_str = f"{pipeline_ms / 1000:.2f}s"
+
+    # Compose the base filename:
+    #   <combo>__<core_args>__<accel_args>__<gpu>_<sec>[__psnrXXdB].png
+    # core_args: always present (steps / gs / seed-or-noise)
+    # accel_args: only when an accelerator is on
+    core_str = "_".join(core_parts)
+    accel_str = ("__" + "_".join(accel_parts)) if accel_parts else ""
+
+    # Baseline meta file: records the canonical baseline png path + ms.
+    BASELINE_META = os.path.join(OUTPUT_DIR, ".baseline_meta.txt")
+
+    if combo == "baseline":
+        # Baseline filename: no PSNR (it IS the reference)
+        out_basename = f"{combo}__{core_str}{accel_str}__{gpu_slug}_{sec_str}.png"
+        out_name = os.path.join(OUTPUT_DIR, out_basename)
+        image.save(out_name)
+        # Record this file as the baseline for future PSNR / speedup runs.
+        with open(BASELINE_META, "w") as f:
+            f.write(f"{out_name}\n{pipeline_ms:.3f}\n")
+        psnr_dB = None
+    else:
+        # Acceleration runs: compute PSNR vs baseline image (if available)
+        baseline_img_path = None
+        baseline_ms = None
+        # Prefer the meta written by the baseline run; otherwise fall back
+        # to args.baseline_for_psnr if it exists.
+        if os.path.isfile(BASELINE_META):
+            with open(BASELINE_META) as f:
+                lines = [ln.strip() for ln in f.readlines() if ln.strip()]
+            if len(lines) >= 1 and os.path.isfile(lines[0]):
+                baseline_img_path = lines[0]
+            if len(lines) >= 2:
+                try:
+                    baseline_ms = float(lines[1])
+                except ValueError:
+                    pass
+        if baseline_img_path is None and os.path.isfile(args.baseline_for_psnr):
+            baseline_img_path = args.baseline_for_psnr
+
+        psnr_dB = None
+        if baseline_img_path is not None:
+            # Save to a temp PIL buffer first to compute PSNR vs the saved
+            # baseline png.  We compute PSNR on the in-memory PIL image to
+            # avoid a write-then-read roundtrip.
+            import numpy as _np
+            ref = _np.array(Image.open(baseline_img_path).convert("RGB"), dtype=_np.float64)
+            cur = _np.array(image.convert("RGB"), dtype=_np.float64)
+            if ref.shape != cur.shape:
+                cur_pil = image.convert("RGB").resize(
+                    (ref.shape[1], ref.shape[0]), Image.Resampling.LANCZOS
+                )
+                cur = _np.array(cur_pil, dtype=_np.float64)
+            mse = ((ref - cur) ** 2).mean()
+            psnr_dB = float("inf") if mse <= 1e-10 else float(
+                20.0 * _np.log10(255.0) - 10.0 * _np.log10(mse)
+            )
+
+        psnr_str = "psnrINF" if psnr_dB == float("inf") else (
+            f"psnr{psnr_dB:.2f}dB" if psnr_dB is not None else "psnrNA"
+        )
+        out_basename = f"{combo}__{core_str}{accel_str}__{gpu_slug}_{sec_str}__{psnr_str}.png"
+        out_name = os.path.join(OUTPUT_DIR, out_basename)
+        image.save(out_name)
+
+    # Concatenated triptych alongside, same naming convention with prefix
     concatenated_image = Image.new('RGB', (cond_A_image.width * 3, cond_A_image.height))
     concatenated_image.paste(cond_A_image, (0, 0))
     concatenated_image.paste(cond_B_image, (cond_A_image.width, 0))
     concatenated_image.paste(image, (cond_A_image.width * 2, 0))
-    concat_name = f"concatenated{suffix}.png"
+    concat_name = os.path.join(OUTPUT_DIR, f"concat_{out_basename}")
     concatenated_image.save(concat_name)
     print(f"[saved] {out_name}, {concat_name}")
 
-    # Persist this run's wall-clock so the next run can compute speedup
-    time_file = f"result{suffix}.time"
-    with open(time_file, "w") as f:
-        f.write(f"{pipeline_ms:.3f}\n")
-
-    # Speedup vs baseline (pure baseline = no acceleration)
-    if suffix:
-        baseline_time_file = "result.time"
-        if os.path.isfile(baseline_time_file):
-            with open(baseline_time_file) as f:
-                baseline_ms = float(f.read().strip())
-            print(f"[time] baseline = {baseline_ms / 1000:.3f} s, "
-                  f"{tag} = {pipeline_ms / 1000:.3f} s, "
-                  f"speedup = {baseline_ms / pipeline_ms:.2f}x "
-                  f"(saved {(baseline_ms - pipeline_ms) / 1000:.3f} s)")
+    # Speedup vs baseline (only when current run is an accel run AND a
+    # baseline meta record exists)
+    if combo != "baseline":
+        if os.path.isfile(BASELINE_META):
+            with open(BASELINE_META) as f:
+                lines = [ln.strip() for ln in f.readlines() if ln.strip()]
+            if len(lines) >= 2:
+                try:
+                    bl_ms = float(lines[1])
+                    print(f"[time] baseline = {bl_ms / 1000:.3f} s, "
+                          f"{tag} = {pipeline_ms / 1000:.3f} s, "
+                          f"speedup = {bl_ms / pipeline_ms:.2f}x "
+                          f"(saved {(bl_ms - pipeline_ms) / 1000:.3f} s)")
+                except ValueError:
+                    pass
         else:
-            print(f"[time] baseline {baseline_time_file} not found; "
-                  f"run `python infer.py` first to record baseline.")
+            print("[time] no baseline meta found; "
+                  "run `python infer.py` (no flags) once to record baseline.")
 
-    if suffix:
-        if os.path.isfile(args.baseline_for_psnr):
-            psnr = compute_psnr(args.baseline_for_psnr, out_name)
-            print(f"[PSNR] {args.baseline_for_psnr} vs {out_name} = {psnr:.4f} dB")
+        if psnr_dB is not None:
+            print(f"[PSNR] vs baseline = {psnr_dB:.4f} dB")
         else:
-            print(f"[PSNR] baseline {args.baseline_for_psnr} not found; "
-                  f"run `python infer.py` first (without acceleration) to generate it.")
+            print("[PSNR] baseline image not found; cannot compute PSNR.")
 
 
 if __name__ == "__main__":
