@@ -15,6 +15,7 @@ from safetensors.torch import load_file
 from src.detail_encoder import DetailEncoder
 from src.kontext_custom_pipeline import FluxKontextPipelineWithPhotoEncoderAddTokens
 from src.regione_adapter import enable_regione, RegionEArgs
+from src.teacache_adapter import enable_teacache, TeaCacheArgs, teacache_summary
 from diffusers.utils import load_image
 from huggingface_hub import hf_hub_download
 
@@ -83,6 +84,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--use_regione", action="store_true",
                         help="Enable RegionE sparse-Q acceleration on the middle steps")
+    parser.add_argument("--use_teacache", action="store_true",
+                        help="Enable TeaCache (timestep-level skip with residual reuse). "
+                             "Composes with --use_regione: in that case TeaCache only "
+                             "fires during RegionE FULL steps that are not warmup-1 / refresh / post.")
+    parser.add_argument("--rel_l1_thresh", type=float, default=0.4,
+                        help="TeaCache rel_l1_thresh. 0.25=1.5x, 0.4=1.8x, 0.6=2.0x, 0.8=2.25x.")
     parser.add_argument("--num_inference_steps", type=int, default=28)
     parser.add_argument("--warmup_step", type=int, default=6)
     parser.add_argument("--post_step", type=int, default=2)
@@ -142,6 +149,21 @@ def main():
 
     pipeline.detail_encoder = detail_encoder
     set_single_lora(pipeline.transformer, kontext_lora_path, lora_weights=[1])
+
+    # IMPORTANT: TeaCache patches transformer.forward.  RegionE wraps whatever
+    # forward is currently bound on the transformer at enable time.  So the
+    # order MUST be: lora -> teacache -> regione.  Reversing this would
+    # bypass TeaCache entirely.
+    if args.use_teacache:
+        enable_teacache(
+            pipeline,
+            TeaCacheArgs(
+                enable=True,
+                num_inference_steps=args.num_inference_steps,
+                rel_l1_thresh=args.rel_l1_thresh,
+                debug=args.debug,
+            ),
+        )
 
     if args.use_regione:
         enable_regione(
@@ -224,49 +246,65 @@ def main():
     ev_end.record()
     torch.cuda.synchronize()
     pipeline_ms = ev_start.elapsed_time(ev_end)
-    tag = "RegionE" if args.use_regione else "baseline"
+    # Build a tag describing the active acceleration combo
+    tag_parts = []
+    if args.use_regione:
+        tag_parts.append("RegionE")
+    if args.use_teacache:
+        tag_parts.append(f"TeaCache(t={args.rel_l1_thresh})")
+    tag = "+".join(tag_parts) if tag_parts else "baseline"
     print(f"[time] pipeline ({tag}) = {pipeline_ms / 1000:.3f} s "
           f"({pipeline_ms / args.num_inference_steps:.1f} ms/step over {args.num_inference_steps} steps)")
+    if args.use_teacache:
+        print(teacache_summary(pipeline))
 
     display_width = size[0]
     display_height = size[1]
     image = image.resize((display_width, display_height), Image.Resampling.LANCZOS)
 
-    out_name = args.output or ("result_regione.png" if args.use_regione else "result.png")
+    # Suffix encodes the acceleration combo: "" / "_regione" / "_teacache" / "_regione_teacache"
+    suffix = ""
+    if args.use_regione:
+        suffix += "_regione"
+    if args.use_teacache:
+        suffix += "_teacache"
+
+    out_name = args.output or f"result{suffix}.png"
     image.save(out_name)
     concatenated_image = Image.new('RGB', (cond_A_image.width * 3, cond_A_image.height))
     concatenated_image.paste(cond_A_image, (0, 0))
     concatenated_image.paste(cond_B_image, (cond_A_image.width, 0))
     concatenated_image.paste(image, (cond_A_image.width * 2, 0))
-    concat_name = "concatenated_regione.png" if args.use_regione else "concatenated.png"
+    concat_name = f"concatenated{suffix}.png"
     concatenated_image.save(concat_name)
     print(f"[saved] {out_name}, {concat_name}")
 
     # Persist this run's wall-clock so the next run can compute speedup
-    time_file = "result_regione.time" if args.use_regione else "result.time"
+    time_file = f"result{suffix}.time"
     with open(time_file, "w") as f:
         f.write(f"{pipeline_ms:.3f}\n")
 
-    if args.use_regione:
+    # Speedup vs baseline (pure baseline = no acceleration)
+    if suffix:
         baseline_time_file = "result.time"
         if os.path.isfile(baseline_time_file):
             with open(baseline_time_file) as f:
                 baseline_ms = float(f.read().strip())
             print(f"[time] baseline = {baseline_ms / 1000:.3f} s, "
-                  f"RegionE = {pipeline_ms / 1000:.3f} s, "
+                  f"{tag} = {pipeline_ms / 1000:.3f} s, "
                   f"speedup = {baseline_ms / pipeline_ms:.2f}x "
                   f"(saved {(baseline_ms - pipeline_ms) / 1000:.3f} s)")
         else:
             print(f"[time] baseline {baseline_time_file} not found; "
                   f"run `python infer.py` first to record baseline.")
 
-    if args.use_regione:
+    if suffix:
         if os.path.isfile(args.baseline_for_psnr):
             psnr = compute_psnr(args.baseline_for_psnr, out_name)
             print(f"[PSNR] {args.baseline_for_psnr} vs {out_name} = {psnr:.4f} dB")
         else:
             print(f"[PSNR] baseline {args.baseline_for_psnr} not found; "
-                  f"run `python infer.py` first (without --use_regione) to generate it.")
+                  f"run `python infer.py` first (without acceleration) to generate it.")
 
 
 if __name__ == "__main__":
