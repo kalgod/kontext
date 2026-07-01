@@ -374,7 +374,7 @@ def main():
 
     if combo == "baseline":
         # Baseline filename: no PSNR (it IS the reference)
-        out_basename = f"{combo}__{core_str}{accel_str}__{gpu_slug}_{sec_str}.png"
+        out_basename = f"{combo}_{sec_str}.png"
         out_name = os.path.join(OUTPUT_DIR, out_basename)
         image.save(out_name)
         # Record this file as the baseline for future PSNR / speedup runs.
@@ -421,7 +421,7 @@ def main():
         psnr_str = "psnrINF" if psnr_dB == float("inf") else (
             f"psnr{psnr_dB:.2f}dB" if psnr_dB is not None else "psnrNA"
         )
-        out_basename = f"{combo}__{core_str}{accel_str}__{gpu_slug}_{sec_str}__{psnr_str}.png"
+        out_basename = f"{combo}_{sec_str}_{psnr_str}.png"
         out_name = os.path.join(OUTPUT_DIR, out_basename)
         image.save(out_name)
 
